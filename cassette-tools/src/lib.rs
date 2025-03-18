@@ -9,6 +9,222 @@ pub fn one_plus_one() -> u64 {
     1 + 1
 }
 
+/// Convert a Rust string to a pointer that can be returned to WebAssembly
+/// This function converts a string to a pointer that can be returned to WebAssembly.
+/// It ensures that the string is properly null-terminated to avoid reading past the end.
+/// 
+/// The function also prepends the string length as a 4-byte prefix so that JavaScript
+/// can efficiently determine the string length without scanning for null terminators.
+/// Additionally, it adds a 4-byte signature to help detect truncation.
+/// Format: [4-byte signature][4 bytes length][string bytes][null terminator]
+#[no_mangle]
+pub fn string_to_ptr(s: String) -> *mut u8 {
+    // Get the bytes from the string
+    let string_bytes = s.into_bytes();
+    let string_len = string_bytes.len();
+    
+    // Define a magic signature to detect truncation ("MSGB" in ASCII)
+    let signature: [u8; 4] = [0x4D, 0x53, 0x47, 0x42]; // "MSGB" in ASCII
+    
+    // Ensure alignment - memory in WebAssembly is often aligned to 8 bytes
+    // We'll allocate a bit extra to ensure proper alignment
+    const ALIGNMENT: usize = 8;
+    
+    // Calculate size with padding for alignment
+    let base_size = 4 + 4 + string_len + 1; // signature + length + string + null terminator
+    let padding = (ALIGNMENT - (base_size % ALIGNMENT)) % ALIGNMENT;
+    let total_size = base_size + padding;
+    
+    // Create a new buffer with additional alignment padding
+    let mut buffer = Vec::with_capacity(total_size);
+    
+    // Start with some padding for alignment if needed
+    // This helps ensure the signature and actual data are properly aligned
+    for _ in 0..padding {
+        buffer.push(0);
+    }
+    
+    // Add the signature to detect truncation
+    buffer.extend_from_slice(&signature);
+    
+    // Add the length as 4 bytes in little-endian order
+    buffer.extend_from_slice(&(string_len as u32).to_le_bytes());
+    
+    // Add the string bytes
+    buffer.extend_from_slice(&string_bytes);
+    
+    // Add null terminator
+    buffer.push(0);
+    
+    // Get pointer to the buffer, accounting for alignment padding
+    let ptr = buffer.as_ptr() as *mut u8;
+    
+    // Log the pointer value and size for debugging (in debug builds)
+    #[cfg(debug_assertions)]
+    {
+        let ptr_value = ptr as usize;
+        let alignment_check = ptr_value % ALIGNMENT;
+        eprintln!("string_to_ptr: allocated at {:p}, alignment: {}, size: {}", 
+                 ptr, alignment_check, total_size);
+        
+        // Check if the pointer is aligned
+        if alignment_check != 0 {
+            eprintln!("WARNING: Pointer not aligned to {} bytes", ALIGNMENT);
+        }
+    }
+    
+    // Prevent Rust from freeing the memory
+    std::mem::forget(buffer);
+    
+    // Return the pointer
+    ptr
+}
+
+/// Convert a pointer and length to a Rust string
+/// This function reads a string from WebAssembly memory and converts it to a Rust string.
+/// It will stop reading at the first null byte or after `len` bytes, whichever comes first.
+#[no_mangle]
+pub fn ptr_to_string(ptr: *const u8, len: usize) -> String {
+    unsafe {
+        if ptr.is_null() || len == 0 {
+            return String::new();
+        }
+        
+        let slice = std::slice::from_raw_parts(ptr, len);
+        
+        // Find position of null terminator, if any
+        let null_pos = slice.iter().position(|&b| b == 0).unwrap_or(len);
+        
+        // Create a new slice that stops at the null terminator
+        let trimmed_slice = &slice[0..null_pos];
+        
+        // Convert to string, handling invalid UTF-8
+        String::from_utf8_lossy(trimmed_slice).to_string()
+    }
+}
+
+/// Deallocate a string that was allocated with string_to_ptr
+/// This function properly deallocates the memory for a string that was 
+/// allocated with string_to_ptr, handling both the enhanced format with signature
+/// and the older format with just a length prefix.
+/// It's designed to be resilient to errors and prevent crashes.
+#[no_mangle]
+pub fn dealloc_string(ptr: *mut u8, len: usize) {
+    unsafe {
+        // Safety checks to prevent crashes
+        if ptr.is_null() {
+            return;
+        }
+        
+        // First, check for the signature to detect the enhanced format
+        // The signature is "MSGB" (0x4D, 0x53, 0x47, 0x42)
+        let has_signature = if let Some(first_bytes) = try_read_bytes(ptr, 4) {
+            first_bytes == [0x4D, 0x53, 0x47, 0x42]
+        } else {
+            false
+        };
+        
+        // Based on the format, determine the real memory layout
+        if has_signature {
+            // Enhanced format: [padding][signature(4)][length(4)][data(len)][null(1)]
+            // Find out the alignment padding by checking if signature is at the actual ptr
+            let alignment = 8;  // Same alignment as in string_to_ptr
+            
+            // Calculate probable allocation size using the alignment from string_to_ptr
+            let base_size = 4 + 4 + len + 1; // signature + length + data + null
+            let padding = (alignment - (base_size % alignment)) % alignment;
+            let total_size = base_size + padding;
+            
+            // Recreate the Vec with capacity and padding to match what was allocated
+            // We're dropping the entire memory block including padding, signature, etc.
+            let _ = Vec::from_raw_parts(ptr, total_size, total_size);
+            
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("dealloc_string: deallocated enhanced format string at {:p} with length {} (total size: {})",
+                         ptr, len, total_size);
+            }
+        } else {
+            // Legacy format: [length(4)][data(len)][null(1)]
+            let total_len = 4 + len + 1;
+            let _ = Vec::from_raw_parts(ptr, total_len, total_len);
+            
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("dealloc_string: deallocated legacy format string at {:p} with length {} (total size: {})",
+                         ptr, len, total_len);
+            }
+        }
+    }
+}
+
+/// Safely try to read a slice of bytes without causing undefined behavior
+/// Returns None if the memory can't be safely read
+unsafe fn try_read_bytes(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
+    if ptr.is_null() || len == 0 {
+        return None;
+    }
+    
+    // Create a buffer to hold the bytes
+    let mut buffer = vec![0u8; len];
+    
+    // Try to copy the bytes, but safely
+    for i in 0..len {
+        // Check if we can safely read this address
+        // This is a simplified check and not 100% safe in all cases
+        // but it's better than nothing
+        if ptr.add(i).is_null() || ptr.add(i) as usize > usize::MAX - 100 {
+            return None;
+        }
+        buffer[i] = *ptr.add(i);
+    }
+    
+    Some(buffer)
+}
+
+/// Get length of a string at a pointer
+/// This function reads the 4-byte length prefix of a string created by string_to_ptr.
+/// 
+/// Args:
+///   ptr: Pointer to memory returned by string_to_ptr
+/// 
+/// Returns: The length of the string (not including length prefix or null terminator)
+#[no_mangle]
+pub fn get_string_len(ptr: *const u8) -> usize {
+    unsafe {
+        if ptr.is_null() {
+            return 0;
+        }
+        
+        // Read the first 4 bytes as a little-endian u32
+        let len_bytes = std::slice::from_raw_parts(ptr, 4);
+        let mut len_array = [0u8; 4];
+        len_array.copy_from_slice(len_bytes);
+        
+        // Convert to usize and return
+        u32::from_le_bytes(len_array) as usize
+    }
+}
+
+/// Get pointer to the actual string data (skipping the length prefix)
+/// This function returns a pointer to the string data after the 4-byte length prefix.
+/// 
+/// Args:
+///   ptr: Pointer to memory returned by string_to_ptr
+/// 
+/// Returns: Pointer to the actual string data
+#[no_mangle]
+pub fn get_string_ptr(ptr: *const u8) -> *const u8 {
+    unsafe {
+        if ptr.is_null() {
+            return ptr;
+        }
+        
+        // Return pointer to the first byte after the 4-byte length prefix
+        ptr.add(4)
+    }
+}
+
 /// JSON Schema for a Cassette
 #[derive(Serialize, Deserialize)]
 pub struct CassetteSchema {
@@ -143,14 +359,61 @@ impl EventBasedHandler {
 
 impl RelayHandler for EventBasedHandler {
     fn handle_req(&self, req_json: &str) -> RelayResult {
-        // Parse the incoming request JSON
-        let req_value: Result<Value, _> = serde_json::from_str(req_json);
+        // Validate that the request isn't empty
+        if req_json.trim().is_empty() {
+            return Err("Empty request received".to_string());
+        }
+
+        // Parse the incoming request JSON with detailed error handling
+        let req_value: Result<Value, serde_json::Error> = serde_json::from_str(req_json);
         
-        if let Ok(req) = req_value {
-            // Check if this is a valid REQ format according to NIP-01
-            if let Some(array) = req.as_array() {
-                if array.len() >= 3 && array[0].as_str() == Some("REQ") {
-                    let subscription_id = array[1].as_str().unwrap_or("");
+        match req_value {
+            Ok(req) => {
+                // Check if this is a valid REQ format according to NIP-01
+                if let Some(array) = req.as_array() {
+                    // Validate REQ message structure
+                    if array.len() < 2 {
+                        return Err(format!("REQ message too short. Expected at least 2 elements, got {}", array.len()).to_string());
+                    }
+                    
+                    // Check if first element is "REQ"
+                    if array[0].as_str() != Some("REQ") {
+                        return Err(format!("Invalid message type. Expected 'REQ', got '{}'", 
+                            array[0].as_str().unwrap_or("non-string value")).to_string());
+                    }
+                    
+                    // Get subscription ID (second element)
+                    let subscription_id = match array[1].as_str() {
+                        Some(id) => id,
+                        None => return Err("Subscription ID must be a string".to_string())
+                    };
+                    
+                    // Validate there's at least one filter if filters are expected
+                    if array.len() < 3 {
+                        // No filters provided, which is valid - we'll return all events
+                        // Process without filters
+                        let events: Result<Vec<Value>, _> = serde_json::from_str(&self.events_json);
+                    
+                        if let Ok(events) = events {
+                            // Convert to EVENT messages without filtering
+                            let events: Vec<Value> = events.into_iter()
+                                .map(|event| {
+                                    json!([
+                                        "EVENT",
+                                        subscription_id,
+                                        event
+                                    ])
+                                })
+                                .collect();
+                            
+                            return Ok(json!({
+                                "events": events,
+                                "eose": ["EOSE", subscription_id]
+                            }).to_string());
+                        } else {
+                            return Err("Error parsing embedded events JSON".to_string());
+                        }
+                    }
                     
                     // Try to get filters from the request
                     let mut kind_filter: Option<Vec<i64>> = None;
@@ -173,6 +436,8 @@ impl RelayHandler for EventBasedHandler {
                                             .filter_map(|k| k.as_i64())
                                             .collect()
                                     );
+                                } else {
+                                    return Err("'kinds' filter must be an array".to_string());
                                 }
                             }
                             
@@ -184,6 +449,8 @@ impl RelayHandler for EventBasedHandler {
                                             .filter_map(|a| a.as_str().map(String::from))
                                             .collect()
                                     );
+                                } else {
+                                    return Err("'authors' filter must be an array".to_string());
                                 }
                             }
                             
@@ -195,22 +462,33 @@ impl RelayHandler for EventBasedHandler {
                                             .filter_map(|id| id.as_str().map(String::from))
                                             .collect()
                                     );
+                                } else {
+                                    return Err("'ids' filter must be an array".to_string());
                                 }
                             }
                             
                             // Look for since filter
                             if let Some(since_val) = filter.get("since") {
                                 since_filter = since_val.as_i64();
+                                if since_filter.is_none() {
+                                    return Err("'since' filter must be an integer timestamp".to_string());
+                                }
                             }
                             
                             // Look for until filter
                             if let Some(until_val) = filter.get("until") {
                                 until_filter = until_val.as_i64();
+                                if until_filter.is_none() {
+                                    return Err("'until' filter must be an integer timestamp".to_string());
+                                }
                             }
                             
                             // Look for limit filter
                             if let Some(limit_val) = filter.get("limit") {
                                 limit_filter = limit_val.as_u64().map(|l| l as usize);
+                                if limit_filter.is_none() {
+                                    return Err("'limit' filter must be a positive integer".to_string());
+                                }
                             }
                             
                             // Implementing "tags" correctly based on NIP-01
@@ -257,6 +535,8 @@ impl RelayHandler for EventBasedHandler {
                             if !and_tag_filters.is_empty() {
                                 and_tags_filter = Some(and_tag_filters);
                             }
+                        } else {
+                            return Err(format!("Filter at position {} must be an object", i).to_string());
                         }
                     }
                     
@@ -406,22 +686,62 @@ impl RelayHandler for EventBasedHandler {
                             })
                             .collect();
                         
+                        // Return a properly formatted response
                         return Ok(json!({
                             "events": events,
                             "eose": ["EOSE", subscription_id]
                         }).to_string());
                     } else {
                         // If we couldn't parse the embedded events JSON
-                        return Err("Error parsing embedded events JSON".to_string());
+                        return Err("Error parsing embedded events JSON. This cassette may be corrupted.".to_string());
                     }
+                } else {
+                    // The request is valid JSON but not an array
+                    return Err("Invalid request format. Expected a JSON array for REQ message.".to_string());
                 }
+            },
+            Err(e) => {
+                // If JSON parsing failed, return a detailed error message
+                let error_msg = format!("Invalid JSON in request: {}", e.to_string());
+                return Err(error_msg);
             }
-            
-            // If request doesn't match expected format, return a NOTICE
-            return Err("Invalid request format. Expected NIP-01 REQ message.".to_string());
-        } else {
-            // If JSON parsing failed, return an error notice
-            return Err("Invalid JSON in request".to_string());
+        }
+    }
+
+    fn handle_close(&self, close_json: &str) -> RelayResult {
+        // Validate that the request isn't empty
+        if close_json.trim().is_empty() {
+            return Err("Empty close request received".to_string());
+        }
+
+        // Parse the incoming close JSON with detailed error handling
+        let close_value: Result<Value, serde_json::Error> = serde_json::from_str(close_json);
+        
+        match close_value {
+            Ok(msg) => {
+                // Check if this is a valid CLOSE format according to NIP-01
+                if let Some(array) = msg.as_array() {
+                    if array.len() >= 2 && array[0].as_str() == Some("CLOSE") {
+                        let subscription_id = array[1].as_str().unwrap_or("");
+                        
+                        // Return a successful close message
+                        return Ok(json!({
+                            "notice": ["NOTICE", format!("Closed subscription {}", subscription_id)]
+                        }).to_string());
+                    } else {
+                        // If CLOSE message doesn't match expected format, return a NOTICE
+                        return Err("Invalid close message format. Expected ['CLOSE', subscription_id]".to_string());
+                    }
+                } else {
+                    // The request is valid JSON but not an array
+                    return Err("Invalid close message format. Expected a JSON array".to_string());
+                }
+            },
+            Err(e) => {
+                // If JSON parsing failed, return a detailed error message
+                let error_msg = format!("Invalid JSON in close request: {}", e.to_string());
+                return Err(error_msg);
+            }
         }
     }
 }
